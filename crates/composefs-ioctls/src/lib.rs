@@ -26,6 +26,7 @@
 
 pub mod fsverity;
 pub mod mount;
+pub mod mountid;
 
 #[cfg(feature = "loop-device")]
 pub mod loop_device;
