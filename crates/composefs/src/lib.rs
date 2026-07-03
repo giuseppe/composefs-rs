@@ -53,6 +53,7 @@ pub mod fs;
 pub mod fsverity;
 pub mod mount;
 pub mod mountcompat;
+pub mod mountregistry;
 pub mod progress;
 pub mod repository;
 pub use repository::ImageNotFound;

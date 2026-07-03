@@ -182,6 +182,75 @@ impl MountOptions {
     pub fn into_overlay(self) -> Option<(OwnedFd, OwnedFd)> {
         self.upperdirs
     }
+
+    /// Apply ID-map settings to an erofs mount, if configured.
+    pub fn apply_idmap(&self, erofs_mnt: impl AsFd) -> Result<()> {
+        if let Some(idmap_fd) = &self.idmap_fd {
+            composefs_ioctls::mount::mount_setattr_idmap(erofs_mnt.as_fd(), idmap_fd.as_fd())?;
+        }
+        Ok(())
+    }
+}
+
+/// Creates an overlayfs mount from an existing lower layer fd and data directories.
+///
+/// This is the lower-level building block: it configures and mounts an overlay
+/// without creating the erofs mount itself.  Use [`composefs_fsmount`] when you
+/// want the full erofs+overlay stack, or call this directly when reusing an
+/// existing erofs mount.
+///
+/// # Arguments
+///
+/// * `lower` - File descriptor for the lower layer (typically the root of an erofs mount)
+/// * `name` - Name for the mount source (appears as "composefs:{name}")
+/// * `basedirs` - File descriptors for the base directories containing actual file data
+/// * `verity` - Whether and how to enforce fs-verity verification for overlay files
+/// * `options` - Mount options controlling overlay and read-write behaviour
+///
+/// # Returns
+///
+/// Returns a file descriptor for the mounted overlay filesystem.
+pub fn overlay_fsmount(
+    lower: impl AsFd,
+    name: &str,
+    basedirs: &[BorrowedFd<'_>],
+    verity: VerityRequirement,
+    options: &MountOptions,
+) -> Result<OwnedFd> {
+    let overlayfs = FsHandle::open("overlay")?;
+    fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
+    fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
+    fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
+    match verity {
+        VerityRequirement::Disabled => {}
+        VerityRequirement::Required => {
+            fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
+        }
+        VerityRequirement::Try => {
+            match fsconfig_set_string(overlayfs.as_fd(), "verity", "require") {
+                Ok(()) => {}
+                Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    if let Some((upperdir, workdir)) = &options.upperdirs {
+        overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upperdir.as_fd())?;
+        overlayfs_set_fd(overlayfs.as_fd(), "workdir", workdir.as_fd())?;
+    }
+    overlayfs_set_lower_and_data_fds(&overlayfs, &lower, basedirs)?;
+    fsconfig_create(overlayfs.as_fd())?;
+
+    let mount_attr = if options.read_write {
+        MountAttrFlags::empty()
+    } else {
+        MountAttrFlags::MOUNT_ATTR_RDONLY
+    };
+    Ok(fsmount(
+        overlayfs.as_fd(),
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        mount_attr,
+    )?)
 }
 
 /// Creates a composefs mount using overlayfs with an erofs image and base directories.
@@ -214,39 +283,5 @@ pub fn composefs_fsmount(
         composefs_ioctls::mount::mount_setattr_idmap(erofs_mnt.as_fd(), idmap_fd.as_fd())?;
     }
     let erofs_mnt = prepare_mount(erofs_mnt)?;
-
-    let overlayfs = FsHandle::open("overlay")?;
-    fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
-    fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
-    fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
-    match verity {
-        VerityRequirement::Disabled => {}
-        VerityRequirement::Required => {
-            fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
-        }
-        VerityRequirement::Try => {
-            match fsconfig_set_string(overlayfs.as_fd(), "verity", "require") {
-                Ok(()) => {}
-                Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-    if let Some((upperdir, workdir)) = &options.upperdirs {
-        overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upperdir.as_fd())?;
-        overlayfs_set_fd(overlayfs.as_fd(), "workdir", workdir.as_fd())?;
-    }
-    overlayfs_set_lower_and_data_fds(&overlayfs, &erofs_mnt, basedirs)?;
-    fsconfig_create(overlayfs.as_fd())?;
-
-    let mount_attr = if options.read_write {
-        MountAttrFlags::empty()
-    } else {
-        MountAttrFlags::MOUNT_ATTR_RDONLY
-    };
-    Ok(fsmount(
-        overlayfs.as_fd(),
-        FsMountFlags::FSMOUNT_CLOEXEC,
-        mount_attr,
-    )?)
+    overlay_fsmount(erofs_mnt, name, basedirs, verity, options)
 }

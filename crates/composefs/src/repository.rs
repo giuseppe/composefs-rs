@@ -113,7 +113,8 @@ use crate::{
         FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
         ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
     },
-    mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at},
+    mount::{MountOptions, VerityRequirement, composefs_fsmount, erofs_mount, mount_at},
+    mountregistry::MountRegistry,
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{ErrnoFilter, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
@@ -924,6 +925,7 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     /// Per-invocation EROFS version override set by [`set_erofs_version`](Self::set_erofs_version).
     /// Does not rewrite `meta.json`; only affects this `Repository` instance.
     erofs_version_override: Option<FormatVersion>,
+    mount_registry: MountRegistry,
     /// When true, SplitStreamWriter::done() writes old-format (pre-repr(C))
     /// headers. Used to test backward compatibility with splitstreams
     /// written before #[repr(C)] was added to SplitstreamHeader.
@@ -972,6 +974,8 @@ pub struct GcResult {
     pub images_pruned: u64,
     /// Number of broken symlinks removed in streams/
     pub streams_pruned: u64,
+    /// Number of images kept because they back active mounts
+    pub images_mounted: u64,
 }
 
 /// A structured error found during a filesystem consistency check.
@@ -1392,6 +1396,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             insecure: !has_verity,
             metadata,
             erofs_version_override: None,
+            mount_registry: MountRegistry::new(),
             #[cfg(any(test, feature = "test"))]
             write_old_splitstream_format: std::sync::atomic::AtomicBool::new(false),
             _data: std::marker::PhantomData,
@@ -2564,6 +2569,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     }
 
     /// Mount the image with the provided digest at the target path.
+    ///
+    /// If a live erofs mount for the same image exists in the mount
+    /// registry, the overlay is created on top of the existing erofs
+    /// mount instead of creating a new one.  The erofs mount's file
+    /// handle and unique mount ID are persisted to the runtime
+    /// directory for cross-process reuse and GC protection.
     #[context("Mounting image '{name}' at path")]
     pub fn mount_at(
         &self,
@@ -2571,12 +2582,44 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         mountpoint: impl AsRef<Path>,
         options: &MountOptions,
     ) -> Result<()> {
-        mount_at(
-            self.mount_with_options(name, options)?,
-            CWD,
-            &canonicalize(mountpoint).context("Canonicalizing mountpoint path")?,
-        )
-        .context("Attaching mount at target path")
+        use crate::mount::overlay_fsmount;
+        use crate::mountregistry::MountKind;
+
+        let mountpoint = canonicalize(mountpoint).context("Canonicalizing mountpoint path")?;
+
+        let (image, enable_verity) = self.open_image(name)?;
+        let objects = self
+            .objects_dir()
+            .context("Getting objects directory for mount")?;
+        let verity = if enable_verity {
+            VerityRequirement::Required
+        } else {
+            VerityRequirement::Disabled
+        };
+
+        let overlay =
+            if let Some(cached_fd) = self.mount_registry.try_reuse(name, MountKind::Native) {
+                log::debug!("reusing existing erofs mount for {name}");
+                drop(image);
+                overlay_fsmount(cached_fd, name, &[objects.as_fd()], verity, options)
+                    .context("Creating overlay from cached erofs mount")?
+            } else {
+                log::info!("created new mount for {name} (no existing mount to reuse)");
+                let erofs_mnt = erofs_mount(image)?;
+                options.apply_idmap(&erofs_mnt)?;
+
+                let erofs_fd = self
+                    .mount_registry
+                    .register(name, MountKind::Native, erofs_mnt)
+                    .context("Registering erofs mount")?;
+
+                overlay_fsmount(erofs_fd, name, &[objects.as_fd()], verity, options)
+                    .context("Creating overlay mount")?
+            };
+
+        mount_at(overlay, CWD, &mountpoint).context("Attaching mount at target path")?;
+
+        Ok(())
     }
 
     /// Creates a relative symlink within the repository.
@@ -2972,7 +3015,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let mut live_objects = HashSet::new();
 
         // Build set of additional roots (checked in both images and streams)
-        let extra_roots: HashSet<_> = additional_roots.iter().map(|s| s.to_string()).collect();
+        let mut extra_roots: HashSet<_> = additional_roots.iter().map(|s| s.to_string()).collect();
+
+        // Check mount registry for images backing active mounts
+        let mounted = crate::mountregistry::active_mounts();
+        result.images_mounted = mounted.len() as u64;
+        extra_roots.extend(mounted);
 
         // Collect images: those in images/refs plus caller-specified roots
         let all_images = self
