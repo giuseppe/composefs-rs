@@ -113,7 +113,7 @@ use crate::{
         FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
         ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
     },
-    mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at},
+    mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at, overlay_fsmount},
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{ErrnoFilter, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
@@ -972,6 +972,8 @@ pub struct GcResult {
     pub images_pruned: u64,
     /// Number of broken symlinks removed in streams/
     pub streams_pruned: u64,
+    /// Number of images currently mounted (protected from GC)
+    pub images_mounted: u64,
 }
 
 /// A structured error found during a filesystem consistency check.
@@ -2490,11 +2492,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     #[context("Opening image '{name}'")]
     pub fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
         let image = match self.openat(&format!("images/{name}"), OFlags::RDONLY) {
-            Ok(fd) => fd,
+            Ok(fd) => {
+                trace!("open_image: opened images/{name}");
+                fd
+            }
             Err(Errno::NOENT) if !name.contains('/') => {
                 // Try resolving as a named ref before giving up
                 match self.openat(&format!("images/refs/{name}"), OFlags::RDONLY) {
-                    Ok(fd) => return Ok((fd, true)),
+                    Ok(fd) => {
+                        trace!("open_image: opened images/refs/{name}");
+                        return Ok((fd, true));
+                    }
                     Err(Errno::NOENT) => {
                         return Err(anyhow::Error::new(ImageNotFound {
                             name: name.to_string(),
@@ -2540,6 +2548,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Create a detached mount of an image. This file descriptor can then
     /// be attached via e.g. `move_mount`.
+    ///
+    /// When verity is enabled, attempts to reuse an existing erofs mount
+    /// for the same image (verified by fs-verity digest comparison) before
+    /// creating a new one.
     #[context("Mounting image '{name}'")]
     pub fn mount_with_options(&self, name: &str, options: &MountOptions) -> Result<OwnedFd> {
         let (image, enable_verity) = self.open_image(name)?;
@@ -2551,6 +2563,30 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         } else {
             VerityRequirement::Disabled
         };
+
+        if enable_verity {
+            match measure_verity::<ObjectID>(&image) {
+                Ok(image_digest) => {
+                    if let Some(cached_fd) = crate::mountregistry::try_reuse(name, &image_digest) {
+                        debug!("mount {name}: reusing existing erofs mount");
+                        return overlay_fsmount(
+                            cached_fd,
+                            name,
+                            &[objects.as_fd()],
+                            verity,
+                            options,
+                        )
+                        .context("Creating overlay mount with reused erofs");
+                    }
+                    debug!("mount {name}: no reusable erofs mount found, creating new one");
+                }
+                Err(e) => {
+                    debug!("mount {name}: cannot measure image verity ({e}), skipping reuse");
+                }
+            }
+        } else {
+            debug!("mount {name}: verity disabled, skipping mount reuse");
+        }
 
         composefs_fsmount(image, name, &[objects.as_fd()], verity, options)
             .context("Creating filesystem mount")
@@ -2971,8 +3007,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let mut result = GcResult::default();
         let mut live_objects = HashSet::new();
 
+        let mounted = crate::mountregistry::active_mounts();
+        result.images_mounted = mounted.len() as u64;
+
         // Build set of additional roots (checked in both images and streams)
-        let extra_roots: HashSet<_> = additional_roots.iter().map(|s| s.to_string()).collect();
+        let mut extra_roots: HashSet<_> = additional_roots.iter().map(|s| s.to_string()).collect();
+        for name in &mounted {
+            debug!("GC: protecting mounted image {name}");
+            extra_roots.insert(name.clone());
+        }
 
         // Collect images: those in images/refs plus caller-specified roots
         let all_images = self
@@ -3050,6 +3093,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())
                             .context("Parsing object ID from directory entry")?;
                     if !live_objects.contains(&id) {
+                        if let Ok(obj_fd) = openat(
+                            &dirfd,
+                            filename,
+                            OFlags::RDONLY | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        ) {
+                            if flock(&obj_fd, FlockOperation::NonBlockingLockExclusive).is_err() {
+                                debug!("objects/{first_byte:02x}/{filename:?} is locked, skipping");
+                                continue;
+                            }
+                        }
+
                         // Get file size before removing
                         if let Ok(stat) = statat(&dirfd, filename, AtFlags::empty()) {
                             result.objects_bytes += stat.st_size as u64;

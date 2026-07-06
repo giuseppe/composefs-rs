@@ -12,7 +12,7 @@ use std::{
 use rustix::{
     mount::{
         FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, fsconfig_create,
-        fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
+        fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
     },
     path,
 };
@@ -115,9 +115,13 @@ pub fn mount_at(
 /// `mount_at()` or other mount operations.
 pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     let image = make_erofs_mountable(image)?;
+    log::trace!("erofs_mount: flock(LOCK_SH) on {}", proc_self_fd(&image));
+    rustix::fs::flock(&image, rustix::fs::FlockOperation::LockShared)?;
     let erofs = FsHandle::open("erofs")?;
     fsconfig_set_flag(erofs.as_fd(), "ro")?;
-    fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
+    if fsconfig_set_fd(erofs.as_fd(), "source", image.as_fd()).is_err() {
+        fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
+    }
     fsconfig_create(erofs.as_fd())?;
     Ok(fsmount(
         erofs.as_fd(),
@@ -209,12 +213,29 @@ pub fn composefs_fsmount(
     verity: VerityRequirement,
     options: &MountOptions,
 ) -> Result<OwnedFd> {
+    log::trace!("composefs_fsmount: locking and mounting erofs for {name}");
     let erofs_mnt = erofs_mount(image)?;
     if let Some(idmap_fd) = &options.idmap_fd {
         composefs_ioctls::mount::mount_setattr_idmap(erofs_mnt.as_fd(), idmap_fd.as_fd())?;
     }
     let erofs_mnt = prepare_mount(erofs_mnt)?;
 
+    overlay_fsmount(erofs_mnt, name, basedirs, verity, options)
+}
+
+/// Creates an overlayfs mount on top of an already-mounted erofs lower layer.
+///
+/// This is the lower-level overlay configuration step, separated from
+/// [`composefs_fsmount`] so that callers who already have an erofs mount
+/// fd (e.g. reused from the mount registry) can build the overlay without
+/// re-mounting erofs.
+pub fn overlay_fsmount(
+    lower: impl AsFd,
+    name: &str,
+    basedirs: &[BorrowedFd<'_>],
+    verity: VerityRequirement,
+    options: &MountOptions,
+) -> Result<OwnedFd> {
     let overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
@@ -236,7 +257,7 @@ pub fn composefs_fsmount(
         overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upperdir.as_fd())?;
         overlayfs_set_fd(overlayfs.as_fd(), "workdir", workdir.as_fd())?;
     }
-    overlayfs_set_lower_and_data_fds(&overlayfs, &erofs_mnt, basedirs)?;
+    overlayfs_set_lower_and_data_fds(&overlayfs, &lower, basedirs)?;
     fsconfig_create(overlayfs.as_fd())?;
 
     let mount_attr = if options.read_write {

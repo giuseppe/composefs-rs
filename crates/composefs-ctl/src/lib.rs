@@ -2013,6 +2013,12 @@ where
                 "Objects: {} removed ({} bytes)",
                 result.objects_removed, result.objects_bytes
             );
+            if result.images_mounted > 0 {
+                println!(
+                    "Images currently mounted: {} (protected from GC)",
+                    result.images_mounted
+                );
+            }
             if result.images_pruned > 0 || result.streams_pruned > 0 {
                 println!(
                     "Pruned symlinks: {} images, {} streams",
