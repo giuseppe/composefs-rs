@@ -95,6 +95,18 @@ pub struct GetLayerReply {
     pub dir_count: u32,
 }
 
+/// Reply from `GetImage`: manifest, config, and layer digests for an image
+/// in containers-storage.
+#[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+pub struct GetImageReply {
+    /// Raw OCI manifest JSON.
+    pub manifest: String,
+    /// Raw OCI config JSON.
+    pub config: String,
+    /// Ordered list of layer diff-ids (e.g. `["sha256:abc...", ...]`).
+    pub layer_digests: Vec<String>,
+}
+
 /// Reply from `PutLayer`: the verity hash of the imported layer, whether
 /// it was already present, and per-object transfer statistics.
 #[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
@@ -208,6 +220,13 @@ pub enum OciError {
 pub trait OciProxy {
     /// Query capability tokens supported by the service.
     async fn get_info(&mut self) -> zlink::Result<Result<GetInfoReply, OciError>>;
+
+    /// Retrieve manifest, config, and layer digests for an image in
+    /// containers-storage.
+    async fn get_image(
+        &mut self,
+        image_id: &str,
+    ) -> zlink::Result<Result<GetImageReply, OciError>>;
 
     /// Check whether a layer is present in the repository.
     async fn has_layer(

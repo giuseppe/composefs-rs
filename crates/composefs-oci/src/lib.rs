@@ -30,6 +30,13 @@ pub mod oci_layout;
 pub mod progress;
 pub mod skopeo;
 pub mod tar;
+/// Import container images via skopeo's JSON proxy + varlink socket.
+///
+/// Available when the `containers-storage` feature is enabled (which
+/// implies `varlink`).  Uses `cstor::import_layer_via_transfer` for
+/// the layer drain path.
+#[cfg(feature = "containers-storage")]
+pub(crate) mod skopeo_varlink;
 /// Shared wire types and client proxy for the `org.composefs.Oci` interface.
 ///
 /// Available when the `varlink` feature is enabled.
@@ -99,6 +106,16 @@ pub const BOOT_IMAGE_REF_KEY: &str = "composefs.image.boot";
 
 /// Named ref key for the V1 boot EROFS image derived from this OCI config.
 pub const BOOT_IMAGE_REF_KEY_V1: &str = "composefs.image.boot.v1";
+
+const DOCKER_CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
+
+pub(crate) fn is_container_config_type(media_type: &MediaType) -> bool {
+    match media_type {
+        MediaType::ImageConfig => true,
+        MediaType::Other(s) => s == DOCKER_CONFIG_MEDIA_TYPE,
+        _ => false,
+    }
+}
 
 // Re-export key types for convenience
 #[cfg(feature = "boot")]
@@ -440,13 +457,11 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     {
         let zerocopy = opts.local_fetch == LocalFetchOpt::ZeroCopy;
         let (((manifest_digest, manifest_verity), (config_digest, config_verity)), stats) =
-            cstor::import_from_containers_storage(
+            skopeo_varlink::import_via_skopeo_proxy(
                 repo,
                 image_id,
                 reference,
                 zerocopy,
-                opts.storage_root,
-                opts.additional_image_stores,
                 reporter,
             )
             .await?;
@@ -527,7 +542,7 @@ pub fn extract_diff_ids(
     config_reader: impl Read,
     manifest_layers: &[Descriptor],
 ) -> Result<Vec<OciDigest>> {
-    if *media_type == MediaType::ImageConfig {
+    if is_container_config_type(media_type) {
         let config = ImageConfiguration::from_reader(config_reader)?;
         config
             .rootfs()
