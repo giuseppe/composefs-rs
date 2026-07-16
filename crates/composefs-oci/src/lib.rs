@@ -29,6 +29,13 @@ pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
 pub mod skopeo;
+/// Import container images via skopeo's JSON proxy + varlink socket.
+///
+/// Available when the `containers-storage` feature is enabled (which
+/// implies `varlink`).  Uses `cstor::import_layer_via_transfer` for
+/// the layer drain path.
+#[cfg(feature = "containers-storage")]
+pub(crate) mod skopeo_varlink;
 pub mod tar;
 /// Shared wire types and client proxy for the `org.composefs.Oci` interface.
 ///
@@ -134,6 +141,16 @@ pub(crate) fn take_boot_image_refs<ObjectID>(
 ) -> (HashMap<Box<str>, ObjectID>, HashMap<Box<str>, ObjectID>) {
     refs.into_iter()
         .partition(|(k, _)| k.starts_with(BOOT_IMAGE_REF_KEY))
+}
+
+const DOCKER_CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
+
+pub(crate) fn is_container_config_type(media_type: &MediaType) -> bool {
+    match media_type {
+        MediaType::ImageConfig => true,
+        MediaType::Other(s) => s == DOCKER_CONFIG_MEDIA_TYPE,
+        _ => false,
+    }
 }
 
 // Re-export key types for convenience
@@ -492,13 +509,11 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     {
         let zerocopy = opts.local_fetch == LocalFetchOpt::ZeroCopy;
         let (((manifest_digest, manifest_verity), (config_digest, config_verity)), stats) =
-            cstor::import_from_containers_storage(
+            skopeo_varlink::import_via_skopeo_proxy(
                 repo,
                 image_id,
                 reference,
                 zerocopy,
-                opts.storage_root,
-                opts.additional_image_stores,
                 boot_options.as_ref(),
                 reporter,
             )
@@ -587,7 +602,7 @@ pub fn extract_diff_ids(
     config_reader: impl Read,
     manifest_layers: &[Descriptor],
 ) -> Result<Vec<OciDigest>> {
-    if *media_type == MediaType::ImageConfig {
+    if is_container_config_type(media_type) {
         let config = ImageConfiguration::from_reader(config_reader)?;
         config
             .rootfs()

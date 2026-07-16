@@ -41,8 +41,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
+#[cfg(test)]
+use containers_image_proxy::oci_spec::image::MediaType;
 use containers_image_proxy::oci_spec::image::{
-    Descriptor, Digest as OciDigest, ImageConfiguration, ImageManifest, MediaType,
+    Descriptor, Digest as OciDigest, ImageConfiguration, ImageManifest,
 };
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, readlinkat, unlinkat};
 use rustix::io::Errno;
@@ -244,12 +246,11 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         )?;
 
         // Try to parse as ImageConfiguration, but don't fail for artifacts
-        let (config, mut layer_refs) = match manifest.config().media_type() {
-            MediaType::ImageConfig => {
+        let (config, mut layer_refs) =
+            if crate::is_container_config_type(manifest.config().media_type()) {
                 let config = ImageConfiguration::from_reader(&config_data[..])?;
                 (Some(config), config_named_refs)
-            }
-            _ => {
+            } else {
                 // Artifact - layer refs are in the manifest's named refs.
                 // Filter to only include refs matching known layer digests
                 // from the manifest, rather than removing the config key
@@ -264,8 +265,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
                     .filter(|(k, _)| layer_digests.contains(k.as_ref()))
                     .collect();
                 (None, refs)
-            }
-        };
+            };
 
         // Strip the EROFS image refs from layer_refs (they're not layers)
         let image_ref = layer_refs.remove(crate::IMAGE_REF_KEY);
@@ -307,7 +307,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
 
     /// Returns true if this is a container image (vs an artifact).
     pub fn is_container_image(&self) -> bool {
-        matches!(self.manifest.config().media_type(), MediaType::ImageConfig)
+        crate::is_container_config_type(self.manifest.config().media_type())
     }
 
     /// Returns the manifest digest.
@@ -1658,7 +1658,7 @@ fn fsck_single_image<ObjectID: FsVerityHashValue>(
     }
 
     // 5. Parse config and verify layer references
-    let is_container = matches!(manifest.config().media_type(), MediaType::ImageConfig);
+    let is_container = crate::is_container_config_type(manifest.config().media_type());
 
     if is_container {
         let config = match ImageConfiguration::from_reader(&config_data[..]) {
