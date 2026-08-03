@@ -12,7 +12,7 @@ use std::{
 use rustix::{
     mount::{
         FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, fsconfig_create,
-        fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
+        fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount,
     },
     path,
 };
@@ -115,9 +115,13 @@ pub fn mount_at(
 /// `mount_at()` or other mount operations.
 pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     let image = make_erofs_mountable(image)?;
+    log::trace!("erofs_mount: flock(LOCK_SH) on {}", proc_self_fd(&image));
+    rustix::fs::flock(&image, rustix::fs::FlockOperation::LockShared)?;
     let erofs = FsHandle::open("erofs")?;
     fsconfig_set_flag(erofs.as_fd(), "ro")?;
-    fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
+    if fsconfig_set_fd(erofs.as_fd(), "source", image.as_fd()).is_err() {
+        fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
+    }
     fsconfig_create(erofs.as_fd())?;
     Ok(fsmount(
         erofs.as_fd(),
