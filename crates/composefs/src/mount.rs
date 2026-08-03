@@ -122,6 +122,10 @@ pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     if fsconfig_set_fd(erofs.as_fd(), "source", image.as_fd()).is_err() {
         fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
     }
+    match fsconfig_set_flag(erofs.as_fd(), "superblock_share") {
+        Ok(()) | Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {}
+        Err(e) => return Err(e.into()),
+    }
     fsconfig_create(erofs.as_fd())?;
     Ok(fsmount(
         erofs.as_fd(),
