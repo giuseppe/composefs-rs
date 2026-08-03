@@ -3304,12 +3304,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .into_iter()
             .chain(
                 all_images
-                    .into_iter()
-                    .filter(|(_, name)| extra_roots.contains(name)),
+                    .iter()
+                    .filter(|(_, name)| extra_roots.contains(name))
+                    .cloned(),
             )
             .collect();
 
-        for ref image in root_images {
+        for ref image in &root_images {
             trace!("{image:?} lives as an image");
             live_objects.insert(image.0.clone());
             self.objects_for_image(&image.1)
@@ -3319,6 +3320,27 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     trace!("   with {id:?}");
                     live_objects.insert(id.clone());
                 });
+        }
+
+        // Images that are currently mounted hold a shared flock on their
+        // object file.  Treat them as roots so their objects stay alive.
+        for (id, name) in &all_images {
+            if live_objects.contains(id) {
+                continue;
+            }
+            let object_path = format!("objects/{}", id.to_object_pathname());
+            if let Ok(obj_fd) = self.openat(&object_path, OFlags::RDONLY) {
+                if flock(&obj_fd, FlockOperation::NonBlockingLockExclusive).is_err() {
+                    debug!("{object_path} is locked, keeping image {name} alive");
+                    live_objects.insert(id.clone());
+                    self.objects_for_image(name)
+                        .with_context(|| format!("Collecting objects for locked image {name}"))?
+                        .iter()
+                        .for_each(|id| {
+                            live_objects.insert(id.clone());
+                        });
+                }
+            }
         }
 
         // Collect all streams for the name map, then filter to roots
