@@ -34,6 +34,7 @@ cstorage = { package = "composefs-storage", path = "../composefs-storage", versi
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.18.0", default-features = false }
 rustix = { version = "1.0.0", features = ["fs"] }
+semver = { version = "1.0", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 thiserror = { version = "2.0.0", default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
