@@ -136,6 +136,16 @@ pub(crate) fn take_boot_image_refs<ObjectID>(
         .partition(|(k, _)| k.starts_with(BOOT_IMAGE_REF_KEY))
 }
 
+const DOCKER_CONFIG_MEDIA_TYPE: &str = "application/vnd.docker.container.image.v1+json";
+
+pub(crate) fn is_container_config_type(media_type: &MediaType) -> bool {
+    match media_type {
+        MediaType::ImageConfig => true,
+        MediaType::Other(s) => s == DOCKER_CONFIG_MEDIA_TYPE,
+        _ => false,
+    }
+}
+
 // Re-export key types for convenience
 #[cfg(feature = "boot")]
 pub use boot::{BootImageMatch, find_matching_boot_image, generate_boot_image};
@@ -587,7 +597,7 @@ pub fn extract_diff_ids(
     config_reader: impl Read,
     manifest_layers: &[Descriptor],
 ) -> Result<Vec<OciDigest>> {
-    if *media_type == MediaType::ImageConfig {
+    if is_container_config_type(media_type) {
         let config = ImageConfiguration::from_reader(config_reader)?;
         config
             .rootfs()
